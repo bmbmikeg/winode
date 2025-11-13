@@ -49,14 +49,21 @@ stage1() {
   fi
   if ! [ -e "/dev/disk/by-id/scsi-0Linode_Volume_temp-$LINODE_ID" ]; then
     echo "LinodeID: $LINODE_ID - Creating Block Storage Volume"
-    curl -sH "Content-Type: application/json" \
+    VOLUME_ID=$(curl -sH "Content-Type: application/json" \
       -H "Authorization: Bearer $TOKEN" \
       -X POST -d "{
         \"label\": \"temp-$LINODE_ID\",
         \"size\": 30,
         \"linode_id\": $LINODE_ID
       }" \
-      https://api.linode.com/v4/volumes | json_pp
+      https://api.linode.com/v4/volumes | jq -r '.id')
+    echo "Created Block Storage Volume ID: $VOLUME_ID"
+  else
+    echo "Block storage volume device already exists, querying for Volume ID"
+    VOLUME_ID=$(curl -sH "Authorization: Bearer $TOKEN" \
+      -H "X-Filter: {\"label\": \"temp-$LINODE_ID\"}" \
+      https://api.linode.com/v4/volumes | jq -r '.data[0].id')
+    echo "Found existing Block Storage Volume ID: $VOLUME_ID"
   fi
   while ! [ -e "/dev/disk/by-id/scsi-0Linode_Volume_temp-$LINODE_ID" ]
   do
@@ -70,7 +77,6 @@ stage1() {
   fi
   mkdir "/mnt/temp-$LINODE_ID"
   mount  "/dev/disk/by-id/scsi-0Linode_Volume_temp-$LINODE_ID" /mnt/temp-$LINODE_ID
-  VOLUME_ID=`curl -sH "Authorization: Bearer $TOKEN"     https://api.linode.com/v4/volumes | jq ".data[] | select (.label == \"temp-$LINODE_ID\") | .id"`
   echo "Block Storage Volume ID: $VOLUME_ID"
 
   BLOCK_CONFIG_ID=`curl -sH "Authorization: Bearer $TOKEN" \
