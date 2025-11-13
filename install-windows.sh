@@ -108,14 +108,41 @@ stage1() {
   cp fstab.new /mnt/temp-$LINODE_ID/etc/fstab
   rm fstab.new
   cp $0 /mnt/temp-$LINODE_ID/etc/rc.local
-  chmod +x /mnt/temp-$LINODE_ID/rc.local
+  chmod +x /mnt/temp-$LINODE_ID/etc/rc.local
   sed -i "s/STAGE=1/STAGE=2/" /mnt/temp-$LINODE_ID/etc/rc.local
 
-  # Reboot
-  curl -sH "Content-Type: application/json" \
-      -H "Authorization: Bearer $TOKEN" \
-      -X POST -d "{\"config_id\": $BLOCK_CONFIG_ID}" \
-      https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot | jq
+  # Retry reboot with exponential backoff if Linode is busy
+  MAX_RETRIES=5
+  RETRY_COUNT=0
+  WAIT_TIME=10
+
+  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    echo "Attempting reboot (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+    sleep $WAIT_TIME
+
+    REBOOT_RESPONSE=$(curl -sH "Content-Type: application/json" \
+        -H "Authorization: Bearer $TOKEN" \
+        -X POST -d "{\"config_id\": $BLOCK_CONFIG_ID}" \
+        https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot)
+
+    echo "$REBOOT_RESPONSE" | jq
+
+    # Check if response contains "Linode busy" error
+    if echo "$REBOOT_RESPONSE" | grep -q "Linode busy"; then
+      RETRY_COUNT=$((RETRY_COUNT + 1))
+      WAIT_TIME=$((WAIT_TIME * 2))  # Exponential backoff
+      echo "Linode busy, waiting ${WAIT_TIME}s before retry..."
+    else
+      # Success or different error - exit loop
+      echo "Reboot request completed"
+      break
+    fi
+  done
+
+  if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+    echo "Error: Failed to reboot after $MAX_RETRIES attempts"
+    exit 1
+  fi
 }
 
 stage2() {
@@ -201,10 +228,37 @@ stage2() {
 
   sed -i "s/STAGE=2/STAGE=3/" /etc/rc.local
 
-  sleep 10
-  curl -sH "Content-Type: application/json" \
-      -H "Authorization: Bearer $TOKEN" -X POST\
-      https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot | jq
+  # Retry reboot with exponential backoff if Linode is busy
+  MAX_RETRIES=5
+  RETRY_COUNT=0
+  WAIT_TIME=10
+
+  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    echo "Attempting reboot (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+    sleep $WAIT_TIME
+
+    REBOOT_RESPONSE=$(curl -sH "Content-Type: application/json" \
+        -H "Authorization: Bearer $TOKEN" -X POST\
+        https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot)
+
+    echo "$REBOOT_RESPONSE" | jq
+
+    # Check if response contains "Linode busy" error
+    if echo "$REBOOT_RESPONSE" | grep -q "Linode busy"; then
+      RETRY_COUNT=$((RETRY_COUNT + 1))
+      WAIT_TIME=$((WAIT_TIME * 2))  # Exponential backoff
+      echo "Linode busy, waiting ${WAIT_TIME}s before retry..."
+    else
+      # Success or different error - exit loop
+      echo "Reboot request completed"
+      break
+    fi
+  done
+
+  if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+    echo "Error: Failed to reboot after $MAX_RETRIES attempts"
+    exit 1
+  fi
 }
 
 stage3() {
@@ -248,11 +302,12 @@ stage3() {
   if ! [ -f /usr/bin/wimmount ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt update
-    apt install -yq wimtools genisoimage libwin-hivex-perl
+    apt install -yq wimtools genisoimage libwin-hivex-perl ntfs-3g
   fi
 
+  # v3.2 is required for Windows 11 24H2 driver injection to work --edge gets us this
   if ! [ -f /snap/bin/distrobuilder ]; then
-    snap install distrobuilder --classic
+    snap install distrobuilder --classic --edge
   fi
 
   if ! [ -f woeusb.sh ]; then
@@ -280,23 +335,73 @@ stage3() {
     exit
   fi
 
-  if ! [ -a /dev/sdb1 ]; then
-# Create two Win95 FAT32 (LBA) partitions. 1=7GB, 2=<remainder of volume size>
-cat <<EOF | sfdisk /dev/sdb
-,7G,c
-,,c
-EOF
-  fi
-  mkfs.fat /dev/sdb1
+  # Create manual partition layout to support >4GB files and provide empty installation target
+  # Partition 1: 8GB NTFS (bootable, contains installation media)
+  # Partition 2: Remaining space NTFS (empty, Windows installation target)
+  echo "Creating MBR partition table on /dev/sdb..."
+  parted -s /dev/sdb mklabel msdos
+
+  echo "Creating partition 1 (8GB NTFS for installation media)..."
+  parted -s /dev/sdb mkpart primary ntfs 1MiB 8GiB
+  parted -s /dev/sdb set 1 boot on
+
+  echo "Creating partition 2 (remaining space for Windows installation)..."
+  parted -s /dev/sdb mkpart primary ntfs 8GiB 100%
+
+  # Format both partitions as NTFS
+  echo "Formatting partitions as NTFS..."
+  mkfs.ntfs -f -Q /dev/sdb1  # Quick format for installation media
+  mkfs.ntfs -f -Q /dev/sdb2  # Quick format for Windows installation target
+
+  # Wait for partition table to update
+  sleep 2
+  partprobe /dev/sdb
+  sleep 2
+
+  # Use WoeUSB in partition mode to copy installation media to partition 1 only
+  # This leaves partition 2 empty for Windows installation
+  echo "Copying Windows installation media to /dev/sdb1 with WoeUSB..."
   ./woeusb.sh --partition windows_virtio.iso /dev/sdb1
+
+  # Copy autounattend.xml to the installation media partition
+  echo "Copying autounattend.xml to installation media..."
   mount /dev/sdb1 /mnt
-  cp /root/autounattend.xml /mnt
+  cp /root/autounattend.xml /mnt/
   umount /mnt
   rm /etc/rc.local
-  curl -sH "Content-Type: application/json" \
-      -H "Authorization: Bearer $TOKEN" \
-      -X POST -d "{\"config_id\": $WINDOWS_CONFIG_ID}" \
-      https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot | jq
+
+  # Retry reboot with exponential backoff if Linode is busy
+  MAX_RETRIES=5
+  RETRY_COUNT=0
+  WAIT_TIME=10
+
+  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    echo "Attempting reboot (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+    sleep $WAIT_TIME
+
+    REBOOT_RESPONSE=$(curl -sH "Content-Type: application/json" \
+        -H "Authorization: Bearer $TOKEN" \
+        -X POST -d "{\"config_id\": $WINDOWS_CONFIG_ID}" \
+        https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot)
+
+    echo "$REBOOT_RESPONSE" | jq
+
+    # Check if response contains "Linode busy" error
+    if echo "$REBOOT_RESPONSE" | grep -q "Linode busy"; then
+      RETRY_COUNT=$((RETRY_COUNT + 1))
+      WAIT_TIME=$((WAIT_TIME * 2))  # Exponential backoff
+      echo "Linode busy, waiting ${WAIT_TIME}s before retry..."
+    else
+      # Success or different error - exit loop
+      echo "Reboot request completed"
+      break
+    fi
+  done
+
+  if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+    echo "Error: Failed to reboot after $MAX_RETRIES attempts"
+    exit 1
+  fi
 }
 
 
