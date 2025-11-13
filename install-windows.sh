@@ -274,6 +274,20 @@ stage3() {
     echo "Invalid LinodeID"
     exit
   fi
+
+  # Install all required packages for stage 3 in one operation
+  PACKAGES_NEEDED=false
+  if ! [ -f /usr/bin/wimmount ]; then PACKAGES_NEEDED=true; fi
+  if ! command -v kexec >/dev/null; then PACKAGES_NEEDED=true; fi
+  if ! [ -f /usr/bin/cpio ]; then PACKAGES_NEEDED=true; fi
+
+  if [ "$PACKAGES_NEEDED" = true ]; then
+    echo "Installing required packages..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -yq wimtools genisoimage libwin-hivex-perl ntfs-3g kexec-tools cpio
+  fi
+
   RAW_DISK_ID=`curl -sH "Authorization: Bearer $TOKEN" \
         https://api.linode.com/v4/linode/instances/$LINODE_ID/disks | jq ".data[] | select (.label == \"Windows\") | .id"`
    echo "RAW_DISK_ID: $RAW_DISK_ID"
@@ -305,11 +319,11 @@ stage3() {
       https://api.linode.com/v4/linode/instances/$LINODE_ID/configs | jq '.data[] | select (.label == "Windows") | .id'`
   echo "## Windows Config: $WINDOWS_CONFIG_ID"
 
-  if ! [ -f /usr/bin/wimmount ]; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt update
-    apt install -yq wimtools genisoimage libwin-hivex-perl ntfs-3g
-  fi
+  # Query for the temp block volume ID
+  VOLUME_ID=$(curl -sH "Authorization: Bearer $TOKEN" \
+    -H "X-Filter: {\"label\": \"temp-$LINODE_ID\"}" \
+    https://api.linode.com/v4/volumes | jq -r '.data[0].id')
+  echo "Volume ID: $VOLUME_ID"
 
   # v3.2 is required for Windows 11 24H2 driver injection to work --edge gets us this
   if ! [ -f /snap/bin/distrobuilder ]; then
@@ -374,40 +388,324 @@ stage3() {
   mount /dev/sdb1 /mnt
   cp /root/autounattend.xml /mnt/
   umount /mnt
-  rm /etc/rc.local
 
-  # Retry reboot with exponential backoff if Linode is busy
-  MAX_RETRIES=5
-  RETRY_COUNT=0
-  WAIT_TIME=10
+  # ===== kexec-based cleanup =====
+  echo "Preparing cleanup environment..."
 
-  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    echo "Attempting reboot (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
-    sleep $WAIT_TIME
+  # Build initramfs structure
+  echo "Building initramfs..."
+  mkdir -p /tmp/initramfs/{bin,lib,lib64,dev,proc,sys,etc}
 
-    REBOOT_RESPONSE=$(curl -sH "Content-Type: application/json" \
-        -H "Authorization: Bearer $TOKEN" \
-        -X POST -d "{\"config_id\": $WINDOWS_CONFIG_ID}" \
-        https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot)
+  # Copy busybox
+  cp /bin/busybox /tmp/initramfs/bin/
+  ln -s busybox /tmp/initramfs/bin/sh
 
-    echo "$REBOOT_RESPONSE" | jq
+  # Copy curl and its shared libraries
+  cp /usr/bin/curl /tmp/initramfs/bin/
+  for lib in $(ldd /usr/bin/curl | grep -o '/lib[^ ]*'); do
+    mkdir -p "/tmp/initramfs$(dirname $lib)"
+    cp "$lib" "/tmp/initramfs$lib" 2>/dev/null || true
+  done
 
-    # Check if response contains "Linode busy" error
-    if echo "$REBOOT_RESPONSE" | grep -q "Linode busy"; then
-      RETRY_COUNT=$((RETRY_COUNT + 1))
-      WAIT_TIME=$((WAIT_TIME * 2))  # Exponential backoff
-      echo "Linode busy, waiting ${WAIT_TIME}s before retry..."
-    else
-      # Success or different error - exit loop
-      echo "Reboot request completed"
-      break
+  # Copy jq and its shared libraries
+  cp /usr/bin/jq /tmp/initramfs/bin/
+  for lib in $(ldd /usr/bin/jq | grep -o '/lib[^ ]*'); do
+    mkdir -p "/tmp/initramfs$(dirname $lib)"
+    cp "$lib" "/tmp/initramfs$lib" 2>/dev/null || true
+  done
+
+  # Copy SSL certificates for HTTPS
+  echo "Copying SSL certificates..."
+  mkdir -p /tmp/initramfs/etc/ssl/certs
+  cp -r /etc/ssl/certs/* /tmp/initramfs/etc/ssl/certs/ 2>/dev/null || true
+  # Also copy ca-certificates
+  if [ -f /etc/ca-certificates.conf ]; then
+    cp /etc/ca-certificates.conf /tmp/initramfs/etc/
+  fi
+
+  # Copy kernel modules for network support
+  echo "Copying kernel modules..."
+  KVER=$(uname -r)
+  mkdir -p /tmp/initramfs/lib/modules/$KVER
+
+  # Use modprobe --show-depends to get exact module dependencies
+  echo "Querying virtio_net dependencies..."
+  modprobe --show-depends virtio_net 2>/dev/null | awk '{print $2}' | while read module; do
+    if [ -f "$module" ]; then
+      # Create directory structure in initramfs
+      module_dir=$(dirname "$module")
+      mkdir -p "/tmp/initramfs$module_dir"
+      # Copy the module
+      cp "$module" "/tmp/initramfs$module"
+      echo "  Copied: $module"
     fi
   done
 
-  if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-    echo "Error: Failed to reboot after $MAX_RETRIES attempts"
-    exit 1
+  # Copy modules.dep and related files for modprobe to work
+  echo "Copying module metadata..."
+  cp /lib/modules/$KVER/modules.order /tmp/initramfs/lib/modules/$KVER/ 2>/dev/null || true
+  cp /lib/modules/$KVER/modules.builtin /tmp/initramfs/lib/modules/$KVER/ 2>/dev/null || true
+  cp /lib/modules/$KVER/modules.builtin.bin /tmp/initramfs/lib/modules/$KVER/ 2>/dev/null || true
+
+  # Generate a minimal modules.dep for just the modules we copied
+  depmod -b /tmp/initramfs $KVER 2>/dev/null || true
+
+  # Copy modprobe and kmod
+  cp /usr/bin/kmod /tmp/initramfs/bin/ 2>/dev/null || cp /bin/kmod /tmp/initramfs/bin/ 2>/dev/null || true
+  ln -s kmod /tmp/initramfs/bin/modprobe 2>/dev/null || true
+  ln -s kmod /tmp/initramfs/bin/insmod 2>/dev/null || true
+
+  # Copy kmod dependencies
+  for lib in $(ldd /usr/bin/kmod 2>/dev/null | grep -o '/lib[^ ]*' || ldd /bin/kmod 2>/dev/null | grep -o '/lib[^ ]*'); do
+    mkdir -p "/tmp/initramfs$(dirname $lib)"
+    cp "$lib" "/tmp/initramfs$lib" 2>/dev/null || true
+  done
+
+  # Capture current network configuration
+  # Detect current network interface dynamically
+  CURRENT_IFACE=$(ip route | grep default | awk '{print $5}')
+  CURRENT_IP=$(ip -4 addr show dev $CURRENT_IFACE | grep inet | awk '{print $2}')
+  CURRENT_GW=$(ip route | grep default | awk '{print $3}')
+  echo "Current network: $CURRENT_IFACE with IP $CURRENT_IP, gateway $CURRENT_GW"
+
+  # Create init script for cleanup
+  echo "Creating cleanup script..."
+  cat > /tmp/initramfs/init <<'INITEOF'
+#!/bin/busybox sh
+
+# Mount essential filesystems
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+
+# Load network drivers
+echo "Loading virtio network drivers..."
+export LD_LIBRARY_PATH=/lib:/lib64
+/bin/modprobe virtio_net 2>&1 || /bin/busybox echo "modprobe failed, network may not work"
+
+# Configure networking with static IP
+# Wait for network interfaces to appear (up to 10 seconds)
+echo "Waiting for network interfaces..."
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  IFACE=$(/bin/busybox ls /sys/class/net/ | /bin/busybox grep -v lo | /bin/busybox head -n 1)
+  if [ -n "$IFACE" ]; then
+    break
   fi
+  /bin/busybox sleep 1
+done
+
+# Debug: Show all network interfaces
+echo "=== Network Interface Debug ==="
+/bin/busybox ls -la /sys/class/net/
+/bin/busybox ip link show
+echo "Detected interface: '$IFACE'"
+echo "==============================="
+
+if [ -z "$IFACE" ]; then
+  echo "ERROR: No network interface detected!"
+  IFACE=eth0  # Fallback to eth0
+fi
+
+echo "Using network interface: $IFACE"
+/bin/busybox ip link set lo up
+/bin/busybox ip addr add CURRENT_IP_PLACEHOLDER dev $IFACE
+/bin/busybox ip link set $IFACE up
+/bin/busybox ip route add default via CURRENT_GW_PLACEHOLDER
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+# Give network time to initialize
+/bin/busybox sleep 3
+
+# Verify network configuration
+echo "=== Network Configuration Verification ==="
+echo "IP address being set: CURRENT_IP_PLACEHOLDER"
+echo "Gateway being set: CURRENT_GW_PLACEHOLDER"
+echo ""
+echo "Interface status:"
+/bin/busybox ip addr show
+echo ""
+echo "Routing table:"
+/bin/busybox ip route show
+echo ""
+echo "Testing connectivity to gateway..."
+/bin/busybox ping -c 1 -W 2 CURRENT_GW_PLACEHOLDER && echo "Gateway: OK" || echo "Gateway: FAILED"
+echo ""
+echo "Testing connectivity to 8.8.8.8..."
+/bin/busybox ping -c 1 -W 2 8.8.8.8 && echo "8.8.8.8: OK" || echo "8.8.8.8: FAILED"
+echo ""
+echo "Testing DNS resolution..."
+/bin/busybox nslookup api.linode.com && echo "DNS: OK" || echo "DNS: FAILED"
+echo "=========================================="
+
+# Embedded variables
+TOKEN="TOKEN_PLACEHOLDER"
+LINODE_ID=LINODE_ID_PLACEHOLDER
+VOLUME_ID=VOLUME_ID_PLACEHOLDER
+WINDOWS_CONFIG_ID=WINDOWS_CONFIG_ID_PLACEHOLDER
+
+export LD_LIBRARY_PATH=/lib:/lib64
+
+# Test curl with verbose output
+echo "=== Testing curl HTTPS connectivity ==="
+echo "Attempting to fetch Linode API status..."
+curl -v -H "Authorization: Bearer $TOKEN" \
+  https://api.linode.com/v4/linode/instances/$LINODE_ID/configs 2>&1 | head -20
+echo ""
+echo "Checking SSL certificate bundle..."
+ls -la /etc/ssl/certs/ | head -10
+echo "=========================================="
+
+echo "Cleaning up configuration profiles..."
+
+# Delete Ubuntu config
+UBUNTU_CONFIG_ID=$(curl -sH "Authorization: Bearer $TOKEN" \
+  https://api.linode.com/v4/linode/instances/$LINODE_ID/configs | \
+  jq -r '.data[] | select(.label | test("My (Ubuntu|Debian).*")) | .id')
+if [ -n "$UBUNTU_CONFIG_ID" ]; then
+  echo "Deleting Ubuntu config ID: $UBUNTU_CONFIG_ID"
+  curl -sH "Authorization: Bearer $TOKEN" \
+    -X DELETE https://api.linode.com/v4/linode/instances/$LINODE_ID/configs/$UBUNTU_CONFIG_ID
+fi
+
+# Delete BLOCK config
+BLOCK_CONFIG_ID=$(curl -sH "Authorization: Bearer $TOKEN" \
+  https://api.linode.com/v4/linode/instances/$LINODE_ID/configs | \
+  jq -r '.data[] | select(.label == "BLOCK") | .id')
+if [ -n "$BLOCK_CONFIG_ID" ]; then
+  echo "Deleting BLOCK config ID: $BLOCK_CONFIG_ID"
+  curl -sH "Authorization: Bearer $TOKEN" \
+    -X DELETE https://api.linode.com/v4/linode/instances/$LINODE_ID/configs/$BLOCK_CONFIG_ID
+fi
+
+echo "Detaching block volume ID: $VOLUME_ID"
+DETACH_RESPONSE=$(curl -sH "Authorization: Bearer $TOKEN" \
+  -X POST https://api.linode.com/v4/volumes/$VOLUME_ID/detach)
+echo "Detach API response: $DETACH_RESPONSE"
+
+# Poll for detachment (60 second timeout)
+echo "Waiting for volume detachment..."
+DETACHED=false
+for i in $(seq 1 30); do
+  echo "Detachment check attempt $i/30..."
+  VOLUME_STATUS=$(curl -sH "Authorization: Bearer $TOKEN" \
+    https://api.linode.com/v4/volumes/$VOLUME_ID)
+  ATTACHED=$(echo "$VOLUME_STATUS" | jq -r '.linode_id')
+  echo "Volume status: linode_id=$ATTACHED"
+
+  if [ "$ATTACHED" = "null" ]; then
+    DETACHED=true
+    echo "Volume detached successfully"
+    break
+  fi
+  /bin/busybox sleep 2
+done
+
+# Delete volume if detached
+if [ "$DETACHED" = "true" ]; then
+  echo "Deleting block volume..."
+  curl -sH "Authorization: Bearer $TOKEN" \
+    -X DELETE https://api.linode.com/v4/volumes/$VOLUME_ID
+else
+  echo "Volume detachment timed out, skipping deletion"
+fi
+
+# Reboot to Windows config with retry logic
+echo "Rebooting to Windows configuration..."
+MAX_RETRIES=5
+RETRY_COUNT=0
+WAIT_TIME=10
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+  /bin/busybox sleep $WAIT_TIME
+
+  REBOOT_RESPONSE=$(curl -sH "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN" \
+    -X POST -d "{\"config_id\": $WINDOWS_CONFIG_ID}" \
+    https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot)
+
+  if echo "$REBOOT_RESPONSE" | grep -q "Linode busy"; then
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    WAIT_TIME=$((WAIT_TIME * 2))
+    echo "Linode busy, retrying in ${WAIT_TIME}s..."
+  else
+    echo "Reboot initiated successfully"
+    break
+  fi
+done
+
+# Fallback to forced reboot
+echo "Forcing reboot in 10 seconds..."
+/bin/busybox sleep 10
+/bin/busybox reboot -f
+
+# Wait indefinitely for reboot to complete (init must never exit)
+echo "Waiting for reboot to complete..."
+while true; do
+  /bin/busybox sleep 60
+done
+INITEOF
+
+  # Validate all required variables are set
+  if [ -z "$VOLUME_ID" ]; then echo "ERROR: VOLUME_ID not set"; exit 1; fi
+  if [ -z "$WINDOWS_CONFIG_ID" ]; then echo "ERROR: WINDOWS_CONFIG_ID not set"; exit 1; fi
+  if [ -z "$LINODE_ID" ]; then echo "ERROR: LINODE_ID not set"; exit 1; fi
+  if [ -z "$TOKEN" ]; then echo "ERROR: TOKEN not set"; exit 1; fi
+  if [ -z "$CURRENT_IP" ]; then echo "ERROR: CURRENT_IP not set"; exit 1; fi
+  if [ -z "$CURRENT_GW" ]; then echo "ERROR: CURRENT_GW not set"; exit 1; fi
+
+  echo "Cleanup variables validated: VOLUME_ID=$VOLUME_ID LINODE_ID=$LINODE_ID WINDOWS_CONFIG_ID=$WINDOWS_CONFIG_ID"
+
+  # Substitute placeholders with actual values
+  sed -i "s|CURRENT_IP_PLACEHOLDER|$CURRENT_IP|g" /tmp/initramfs/init
+  sed -i "s|CURRENT_GW_PLACEHOLDER|$CURRENT_GW|g" /tmp/initramfs/init
+  sed -i "s|TOKEN_PLACEHOLDER|$TOKEN|g" /tmp/initramfs/init
+  sed -i "s|LINODE_ID_PLACEHOLDER|$LINODE_ID|g" /tmp/initramfs/init
+  sed -i "s|VOLUME_ID_PLACEHOLDER|$VOLUME_ID|g" /tmp/initramfs/init
+  sed -i "s|WINDOWS_CONFIG_ID_PLACEHOLDER|$WINDOWS_CONFIG_ID|g" /tmp/initramfs/init
+
+  chmod +x /tmp/initramfs/init
+
+  # Pack initramfs
+  echo "Packing initramfs..."
+  cd /tmp/initramfs
+  find . | cpio -o -H newc 2>/dev/null | gzip > /tmp/cleanup.cpio.gz
+  cd /
+
+  # Load kernel and initramfs with kexec
+  echo "Loading cleanup environment with kexec..."
+
+  # Extract only safe kernel parameters
+  CONSOLE_PARAM=$(cat /proc/cmdline | grep -oE 'console=[^ ]+' || echo "console=ttyS0,19200n8")
+  IFNAMES_PARAM=$(cat /proc/cmdline | grep -oE 'net\.ifnames=[^ ]+' || echo "net.ifnames=0")
+  BIOSDEV_PARAM=$(cat /proc/cmdline | grep -oE 'biosdevname=[^ ]+' || echo "")
+
+  KEXEC_CMDLINE="$CONSOLE_PARAM $IFNAMES_PARAM $BIOSDEV_PARAM quiet"
+  echo "kexec cmdline: $KEXEC_CMDLINE"
+
+  kexec -l /boot/vmlinuz-$(uname -r) \
+    --initrd=/tmp/cleanup.cpio.gz \
+    --append="$KEXEC_CMDLINE"
+
+  # Execute kexec (this never returns)
+  echo "Launching cleanup environment..."
+  echo "Windows installation will continue automatically after cleanup."
+  sleep 2
+  kexec -e
+
+  # Should never reach here
+  echo "ERROR: kexec failed, attempting fallback direct reboot"
+  sleep 5
+
+  # Last resort: reboot to Windows config via API
+  REBOOT_RESPONSE=$(curl -sH "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -X POST -d "{\"config_id\": $WINDOWS_CONFIG_ID}" \
+      https://api.linode.com/v4/linode/instances/$LINODE_ID/reboot)
+
+  echo "$REBOOT_RESPONSE" | jq
+
+  # If that fails, force reboot without cleanup
+  sleep 10
+  reboot -f
 }
 
 
