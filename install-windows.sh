@@ -10,7 +10,7 @@
 #
 #<UDF name="TOKEN" Label="Linode API Token" />
 #<UDF name="WINDOWS_PASSWORD" Label="Administrator Password for Windows" example="Password" />
-#<UDF name="INSTALL_WINDOWS_VERSION" Label="Windows Version" oneOf="w11,2k22" default="2k22"/>
+#<UDF name="INSTALL_WINDOWS_VERSION" Label="Windows Version" oneOf="w11,2k22" default="w11"/>
 #<UDF name="AUTOLOGIN" Label="Auto Login to Windows" oneOf="true,false" default="true"/>
 #<UDF name="W11_ISO_URL" Label="Windows 11 ISO URL (Not Required For Windows Server) - Get Fresh URL From https://www.microsoft.com/en-us/software-download/windows11" default="NOURL"/>
 
